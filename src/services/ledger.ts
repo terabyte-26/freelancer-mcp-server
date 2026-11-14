@@ -94,19 +94,29 @@ export async function placedBefore(account: string, projectId: number): Promise<
   ) as Promise<{ _id: unknown; bid_at?: Date } | null>;
 }
 
+/** Bids the account placed since the ledger anchor (my_bids), i.e. the credits it spent. */
+export async function placedSinceAnchor(account: string, a: AllowanceDoc | null): Promise<number | null> {
+  const d = await getDb();
+  if (!d || !a?.exhausted_at) return null;
+  return d.collection("my_bids").countDocuments({ account, status: "placed", bid_at: { $gte: new Date(a.exhausted_at) } });
+}
+
 /**
  * Credits the ledger thinks the account has banked: credits earned since the
- * last limit (one per planning interval) minus what it placed since. Mirrors
- * the bot's model closely enough for a go / no-go; null when unknown.
+ * last BID_LIMIT_EXCEEDED (one per planning interval) minus the bids placed
+ * since (counted from my_bids, like the bot's pool line). null when unknown.
  */
-export function creditsEstimate(a: AllowanceDoc | null, now = new Date()): number | null {
+export function creditsEstimate(a: AllowanceDoc | null, placedSince: number | null, now = new Date()): number | null {
   if (!a) return null;
-  if (typeof a.credits_est === "number") return a.credits_est;
   const anchor = a.exhausted_at ? new Date(a.exhausted_at) : null;
   const interval = Number(a.interval_plan_s || a.interval_obs_s || a.interval_api_s || 0);
-  if (!anchor || !interval) return null;
+  if (!anchor || !interval || placedSince === null) return typeof a.credits_est === "number" ? a.credits_est : null;
   const earned = Math.floor((now.getTime() - anchor.getTime()) / 1000 / interval);
-  return Math.max(0, earned - Number(a.placed_since || 0));
+  return Math.max(0, earned - placedSince);
+}
+
+export async function creditsFor(account: string, a: AllowanceDoc | null): Promise<number | null> {
+  return creditsEstimate(a, await placedSinceAnchor(account, a));
 }
 
 export interface GuardVerdict {
@@ -131,7 +141,7 @@ export async function bidGuard(account: string, projectId: number): Promise<Guar
     ]);
     verdict.health = health;
     verdict.bidsToday = today;
-    verdict.credits = creditsEstimate(allowance);
+    verdict.credits = await creditsFor(account, allowance);
     if (dup) {
       verdict.ok = false;
       verdict.reasons.push(`${account} already placed a bid on project ${projectId}` +

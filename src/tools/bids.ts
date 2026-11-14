@@ -3,7 +3,7 @@ import { z } from "zod";
 import { apiGet, apiPost, formatDate, mcpError, truncate, resolveAccountLabel, ACCOUNT_DESC } from "../services/api.js";
 import { FreelancerBid, FreelancerProject } from "../types.js";
 import { CHARACTER_LIMIT, DEFAULT_LIMIT, MAX_LIMIT } from "../constants.js";
-import { bidGuard, recordBid, ledgerEnabled, allowanceFor, accountHealth, bidsToday, creditsEstimate } from "../services/ledger.js";
+import { bidGuard, recordBid, ledgerEnabled, allowanceFor, accountHealth, bidsToday, creditsFor } from "../services/ledger.js";
 
 export function registerBidTools(server: McpServer): void {
   // Get bids on a project
@@ -150,7 +150,7 @@ Use when: "Do we have bid credits left?", "Can TeraByte26 bid right now?", "Is H
           return { content: [{ type: "text", text: "MONGO_URI is not set on this server, so the bot's ledger is not available here." }] };
         }
         const [allowance, health, today] = await Promise.all([allowanceFor(label), accountHealth(label), bidsToday(label)]);
-        const credits = creditsEstimate(allowance);
+        const credits = await creditsFor(label, allowance);
         const lines = [
           `**${label} — bid credits**`,
           `Credits banked (ledger): ${credits === null ? "unknown (no bid limit seen yet)" : credits}`,
