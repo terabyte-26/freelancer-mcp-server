@@ -100,7 +100,7 @@ Use when: "Tell me more about project 12345678", "Get the details for this proje
         const result = await apiGet<{ projects: Record<string, FreelancerProject> }>(
           "/projects/0.1/projects",
           {
-            "ids[]": project_id,
+            "projects[]": project_id,   // the API wants projects[]; ids[] returns "requires id based filter"
             full_description: true,
             job_details: true,
             upgrade_details: true,
