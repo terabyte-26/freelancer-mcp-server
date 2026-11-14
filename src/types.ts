@@ -87,9 +87,11 @@ export interface FreelancerThread {
     owner?: number;
     context?: { type?: string; id?: number };
     time_created?: number;
+    message?: FreelancerMessage;
   };
   message_count?: number;
   time_updated?: number;
+  is_read?: boolean;
 }
 
 export interface ApiResponse<T> {

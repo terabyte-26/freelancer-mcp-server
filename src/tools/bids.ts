@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { apiGet, apiPost, formatDate, mcpError, truncate, ACCOUNT_DESC } from "../services/api.js";
-import { FreelancerBid } from "../types.js";
+import { apiGet, apiPost, formatDate, mcpError, truncate, resolveAccountLabel, ACCOUNT_DESC } from "../services/api.js";
+import { FreelancerBid, FreelancerProject } from "../types.js";
 import { CHARACTER_LIMIT, DEFAULT_LIMIT, MAX_LIMIT } from "../constants.js";
+import { bidGuard, recordBid, ledgerEnabled, allowanceFor, accountHealth, bidsToday, creditsEstimate } from "../services/ledger.js";
 
 export function registerBidTools(server: McpServer): void {
   // Get bids on a project
@@ -126,6 +127,48 @@ Use when: "Show my bids", "Which of my bids are active?", "Have any of my bids b
     }
   );
 
+  // Credit / ledger status (from the auto-bid bot's database)
+  server.registerTool(
+    "freelancer_credit_status",
+    {
+      title: "Bid Credit Status",
+      description: `What the auto-bid bot knows about an account's bid credits and health, read from its database (MONGO_URI): credits banked since the last BID_LIMIT_EXCEEDED, bids placed today, whether Freelancer marks the account as limited, and whether auto-bid is on. Call this BEFORE freelancer_place_bid when credits are scarce.
+
+Args:
+  - account (string, optional): ${ACCOUNT_DESC}
+
+Returns: credits estimate, today's bids, plan, account health. Without MONGO_URI it says so.
+
+Use when: "Do we have bid credits left?", "Can TeraByte26 bid right now?", "Is Hamza still limited?"`,
+      inputSchema: z.object({ account: z.string().optional().describe(ACCOUNT_DESC) }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ account }) => {
+      try {
+        const label = resolveAccountLabel(account);
+        if (!ledgerEnabled()) {
+          return { content: [{ type: "text", text: "MONGO_URI is not set on this server, so the bot's ledger is not available here." }] };
+        }
+        const [allowance, health, today] = await Promise.all([allowanceFor(label), accountHealth(label), bidsToday(label)]);
+        const credits = creditsEstimate(allowance);
+        const lines = [
+          `**${label} — bid credits**`,
+          `Credits banked (ledger): ${credits === null ? "unknown (no bid limit seen yet)" : credits}`,
+          allowance?.exhausted_at ? `Last BID_LIMIT_EXCEEDED: ${new Date(allowance.exhausted_at).toISOString().replace("T", " ").slice(0, 16)} UTC` : "",
+          allowance ? `Plan: ${allowance.bid_limit ?? "?"} per ${String((allowance as { duration?: string }).duration || "month")} | credit interval ≈ ${Math.round(Number(allowance.interval_plan_s || allowance.interval_obs_s || 0) / 60)} min` : "",
+          `Bids placed today: ${today ?? "?"}`,
+          health ? `Account: ${health.enabled ? "auto-bid ON" : "auto-bid OFF"} | limited by Freelancer: ${health.limited === undefined ? "unknown" : health.limited ? "YES — bids refused" : "no"}` : "Account: not in the bot's registry",
+        ].filter(Boolean);
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          structuredContent: { account: label, credits, bids_today: today, allowance, health },
+        };
+      } catch (err) {
+        return mcpError((err as Error).message);
+      }
+    }
+  );
+
   // Place a bid
   server.registerTool(
     "freelancer_place_bid",
@@ -133,17 +176,20 @@ Use when: "Show my bids", "Which of my bids are active?", "Have any of my bids b
       title: "Place a Bid",
       description: `Submit a bid / proposal on a Freelancer.com project.
 
+Before the bid goes out, when the server has MONGO_URI, the auto-bid bot's rules are applied: no second bid on a project the account already bid on, no bid from an account Freelancer marks as limited, no bid while the credit ledger says the account has no credit banked. A blocked bid returns the reasons instead of bidding; pass force=true only when you have decided to override them. Every attempt is recorded in the bot's my_bids (via "mcp") so the dashboard, pacing and dedup see it.
+
 Args:
   - project_id (number): Project ID to bid on
   - amount (number): Your bid amount in the project's currency
   - period (number): Delivery time in days
   - description (string): Your proposal text (cover letter)
   - milestone_percentage (number, 0-100, default 100): Percentage to request as initial milestone
+  - force (boolean, default false): Bid even when the bot's guard says no
   - account (string, optional): ${ACCOUNT_DESC} This is the account the bid is placed FROM.
 
-Returns: confirmation with bid ID and status
+Returns: confirmation with bid ID and status, plus the guard's notes
 
-⚠️ This creates a real bid on your account. Review before confirming — including which account, when multiple are configured.
+⚠️ This creates a real bid on your account and spends a bid credit. Review before confirming — including which account, when multiple are configured.
 
 Use when: "Bid $150 on project 12345 with 7 days delivery", "Submit a proposal"`,
       inputSchema: z.object({
@@ -152,11 +198,41 @@ Use when: "Bid $150 on project 12345 with 7 days delivery", "Submit a proposal"`
         period: z.number().int().positive().describe("Delivery time in days"),
         description: z.string().min(10).max(5000).describe("Proposal / cover letter text"),
         milestone_percentage: z.number().int().min(0).max(100).default(100).describe("Percentage to request as initial milestone (default 100)"),
+        force: z.boolean().default(false).describe("Override the bot's credit / health / duplicate guard"),
         account: z.string().optional().describe(ACCOUNT_DESC + " This is the account the bid is placed FROM."),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ project_id, amount, period, description, milestone_percentage, account }) => {
+    async ({ project_id, amount, period, description, milestone_percentage, force, account }) => {
+      let label: string;
+      try {
+        label = resolveAccountLabel(account);
+      } catch (err) {
+        return mcpError((err as Error).message);
+      }
+      const guard = await bidGuard(label, project_id);
+      if (!guard.ok && !force) {
+        return {
+          content: [{
+            type: "text",
+            text: [
+              `⛔ **Bid NOT placed** from ${label} on project ${project_id} — the bot's guard says no:`,
+              ...guard.reasons.map((r) => `- ${r}`),
+              ...guard.notes.map((n) => `- note: ${n}`),
+              "",
+              "Pass force=true to bid anyway (this spends a credit or gets refused by Freelancer).",
+            ].join("\n"),
+          }],
+          structuredContent: { placed: false, guard },
+          isError: true,
+        };
+      }
+      // the project record, for the my_bids row (currency, budget, competition at bid time)
+      let project: FreelancerProject | null = null;
+      try {
+        const r = await apiGet<{ projects: FreelancerProject[] }>("/projects/0.1/projects", { "projects[]": project_id, job_details: true }, label);
+        project = r.projects?.[0] || null;
+      } catch { /* the bid does not depend on it */ }
       try {
         const result = await apiPost<FreelancerBid>("/projects/0.1/bids", {
           project_id,
@@ -164,26 +240,38 @@ Use when: "Bid $150 on project 12345 with 7 days delivery", "Submit a proposal"`
           period,
           description,
           milestone_percentage,
-        }, { account });
-
+        }, { account: label });
+        let recorded: string | null = null;
+        try {
+          recorded = await recordBid({ account: label, projectId: project_id, amount, period, description, project, bid: result, status: "placed" });
+        } catch (e) {
+          guard.notes.push(`my_bids record failed: ${(e as Error).message}`);
+        }
         return {
           content: [
             {
               type: "text",
               text: [
                 `✅ **Bid placed successfully!**`,
+                `Account: ${label}`,
                 `Bid ID: ${result.id}`,
-                `Project: ${project_id}`,
-                `Amount: $${amount} | Delivery: ${period} days`,
+                `Project: ${project_id}${project?.title ? ` — ${project.title}` : ""}`,
+                `Amount: ${amount}${project?.currency && (project.currency as { code?: string }).code ? " " + (project.currency as { code?: string }).code : ""} | Delivery: ${period} days`,
                 `Status: ${result.status}`,
                 `Submitted: ${formatDate(result.time_submitted)}`,
-              ].join("\n"),
+                recorded ? `Recorded in my_bids (${recorded}).` : "",
+                ...guard.notes.map((n) => `note: ${n}`),
+              ].filter(Boolean).join("\n"),
             },
           ],
-          structuredContent: result,
+          structuredContent: { placed: true, bid: result, guard, my_bids_id: recorded },
         };
       } catch (err) {
-        return mcpError((err as Error).message);
+        const code = (err as Error & { code?: string }).code || null;
+        try {
+          await recordBid({ account: label, projectId: project_id, amount, period, description, project, status: "failed", errorCode: code });
+        } catch { /* best effort */ }
+        return mcpError(`${(err as Error).message}${code ? ` [${code}]` : ""}`);
       }
     }
   );

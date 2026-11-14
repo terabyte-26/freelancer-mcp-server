@@ -192,3 +192,14 @@ Issues and PRs welcome. Keep changes scoped to the Freelancer.com API surface â€
 ## License
 
 MIT
+
+## Fork additions (terabyte-26, v2.1.0)
+
+This fork is operated next to an auto-bid bot and adds what that setup needs:
+
+- **Per-account egress.** `FREELANCER_ACCOUNTS` values may be `{"token": "...", "proxy": "http://user:pass@host:port"}` (http, https, socks5, socks5h). Every call of that account leaves through its proxy; the process environment's proxy variables are ignored. `freelancer_check_egress` shows the public IP and the username behind each account so you can prove two accounts never share an IP.
+- **Guarded, recorded bids.** With `MONGO_URI` (the bot's analytics database, `MONGO_DB` default `freelancer_analytics`), `freelancer_place_bid` first checks the bot's facts: a bid already placed on that project by that account (`my_bids`), an account Freelancer marks as limited (`fln_accounts.last_check.limited_account`, every bid is refused), and the credit ledger (`config/bid_allowance*`: no credit banked since the last `BID_LIMIT_EXCEEDED`). A blocked bid returns the reasons; `force: true` overrides. Every attempt is written to `my_bids` with `via: "mcp"`, so dashboards, pacing and dedup see manual bids too. `freelancer_credit_status` shows the same facts on demand.
+- **Paced messaging.** `freelancer_send_message` waits `MESSAGE_MIN_GAP_S` (45) between messages of one account and refuses past `MESSAGE_DAILY_CAP` (80) a day. Bursts are what get accounts limited.
+- **Inbox tooling.** `freelancer_list_threads` shows the other member's username and country, unread state, who wrote last and a snippet (`unread_only: true` to triage); `freelancer_get_messages` prints oldest first and marks your own messages; `freelancer_mark_threads_read` clears threads that need no reply.
+
+`npm run smoke` speaks MCP to the built server and exercises the read-only tools (set `SMOKE_PROJECT_ID` to a project the account already bid on to see the duplicate guard block a bid).

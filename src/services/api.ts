@@ -1,28 +1,71 @@
 import axios, { AxiosInstance, AxiosError } from "axios";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import { FREELANCER_API_BASE } from "../constants.js";
 import { ApiResponse } from "../types.js";
 
-const clients: Map<string, AxiosInstance> = new Map();
+/**
+ * One connected Freelancer account: its OAuth token and, optionally, the proxy
+ * every call of THIS account must leave through (http://, https://, socks5://,
+ * socks5h://, credentials allowed). Two accounts must never share an egress,
+ * so each account gets its own agent and the process environment's proxy
+ * settings are ignored on purpose.
+ */
+export interface AccountConfig {
+  token: string;
+  proxy?: string;
+}
+
+interface AccountClient {
+  client: AxiosInstance;
+  proxy: string;
+  agent?: HttpsProxyAgent<string> | SocksProxyAgent;
+}
+
+const clients: Map<string, AccountClient> = new Map();
 let defaultAccount: string | null = null;
 
+function makeAgent(proxy: string): HttpsProxyAgent<string> | SocksProxyAgent | undefined {
+  if (!proxy) return undefined;
+  const scheme = proxy.split("://")[0].toLowerCase();
+  if (scheme === "http" || scheme === "https") return new HttpsProxyAgent(proxy);
+  if (scheme === "socks5" || scheme === "socks5h" || scheme === "socks4") return new SocksProxyAgent(proxy);
+  throw new Error(`Unsupported proxy scheme "${scheme}" (use http, https, socks5 or socks5h)`);
+}
+
+/** Proxy URL with the credentials removed, for display. */
+export function maskProxy(proxy: string): string {
+  if (!proxy) return "direct";
+  try {
+    const u = new URL(proxy);
+    return `${u.protocol}//${u.hostname}${u.port ? ":" + u.port : ""}`;
+  } catch {
+    return proxy.replace(/\/\/[^@]+@/, "//***@");
+  }
+}
+
 /**
- * Initialize one Freelancer API client per configured account. Each account
- * is just a label -> OAuth token pair; no token ever touches disk except in
- * the caller's own MCP client config.
+ * Initialize one Freelancer API client per configured account. Tokens live
+ * only in memory and in the caller's own MCP client config.
  */
-export function initApiClients(accounts: Record<string, string>): void {
+export function initApiClients(accounts: Record<string, AccountConfig>): void {
   clients.clear();
   defaultAccount = null;
-  for (const [label, token] of Object.entries(accounts)) {
-    if (!token) continue;
-    clients.set(label, axios.create({
+  for (const [label, cfg] of Object.entries(accounts)) {
+    if (!cfg?.token) continue;
+    const agent = makeAgent(cfg.proxy || "");
+    const client = axios.create({
       baseURL: FREELANCER_API_BASE,
       headers: {
-        "freelancer-oauth-v1": token,
+        "freelancer-oauth-v1": cfg.token,
         "Content-Type": "application/json",
       },
-      timeout: 15000,
-    }));
+      timeout: 25000,
+      proxy: false,                 // never pick up HTTP(S)_PROXY from the environment
+      httpAgent: agent,
+      httpsAgent: agent,
+    });
+    clients.set(label, { client, proxy: cfg.proxy || "", agent });
     if (!defaultAccount) defaultAccount = label;
   }
 }
@@ -31,22 +74,42 @@ export function listAccounts(): string[] {
   return Array.from(clients.keys());
 }
 
-function getApiClient(account?: string): AxiosInstance {
+/** Label -> masked egress, for the accounts listing (never the credentials). */
+export function accountEgress(label: string): string {
+  return maskProxy(clients.get(label)?.proxy || "");
+}
+
+export function resolveAccountLabel(account?: string): string {
   const label = account || defaultAccount;
   if (!label) {
     throw new Error(
       "No Freelancer accounts configured. Set FREELANCER_OAUTH_TOKEN (single account) or " +
-        "FREELANCER_ACCOUNTS (multiple, e.g. '{\"main\":\"token1\",\"client2\":\"token2\"}') in your MCP config."
+        "FREELANCER_ACCOUNTS (multiple, e.g. '{\"main\":\"token1\",\"client2\":{\"token\":\"token2\",\"proxy\":\"http://user:pass@host:port\"}}') in your MCP config."
     );
   }
-  const client = clients.get(label);
-  if (!client) {
+  if (!clients.has(label)) {
     throw new Error(
       `Unknown account "${label}". Configured accounts: ${listAccounts().join(", ") || "none"}. ` +
         `Use freelancer_list_accounts to see what's available.`
     );
   }
-  return client;
+  return label;
+}
+
+function getApiClient(account?: string): AxiosInstance {
+  return clients.get(resolveAccountLabel(account))!.client;
+}
+
+/**
+ * The public IP a request of this account leaves from (through its proxy when
+ * it has one). Uses a plain client bound to the same agent, no Freelancer
+ * header, so the token is never sent to the IP service.
+ */
+export async function egressIp(account?: string): Promise<string> {
+  const entry = clients.get(resolveAccountLabel(account))!;
+  const probe = axios.create({ timeout: 15000, proxy: false, httpAgent: entry.agent, httpsAgent: entry.agent });
+  const r = await probe.get<{ ip: string }>("https://api.ipify.org", { params: { format: "json" } });
+  return r.data.ip;
 }
 
 function unwrap<T>(data: ApiResponse<T>): T {
@@ -56,6 +119,14 @@ function unwrap<T>(data: ApiResponse<T>): T {
   return data.result;
 }
 
+/** Freelancer's machine-readable error code, when the error came from the API. */
+export function apiErrorCode(error: unknown): string | undefined {
+  if (axios.isAxiosError(error)) {
+    return (error as AxiosError<ApiResponse<unknown>>).response?.data?.error_code;
+  }
+  return undefined;
+}
+
 function toApiError(error: unknown): Error {
   if (axios.isAxiosError(error)) {
     const axiosErr = error as AxiosError<ApiResponse<unknown>>;
@@ -63,7 +134,9 @@ function toApiError(error: unknown): Error {
       axiosErr.response?.data?.message ||
       axiosErr.response?.data?.error_code ||
       axiosErr.message;
-    return new Error(`Freelancer API error (${axiosErr.response?.status}): ${msg}`);
+    const e = new Error(`Freelancer API error (${axiosErr.response?.status}): ${msg}`);
+    (e as Error & { code?: string }).code = axiosErr.response?.data?.error_code;
+    return e;
   }
   return error as Error;
 }
@@ -116,11 +189,12 @@ export async function apiPost<T>(
 export async function apiPut<T>(
   path: string,
   data?: Record<string, unknown>,
-  account?: string
+  account?: string,
+  params?: Record<string, unknown>
 ): Promise<T> {
   const client = getApiClient(account);
   try {
-    const response = await client.put<ApiResponse<T>>(path, data);
+    const response = await client.put<ApiResponse<T>>(path, data, { params });
     return unwrap(response.data);
   } catch (error) {
     throw toApiError(error);
